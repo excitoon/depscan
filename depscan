@@ -1,0 +1,1096 @@
+#!/usr/bin/env python3
+
+"""
+depscan: find *_grpc.pb.go files, extract RPC methods, and use gopls to list
+packages in your workspace that reference each method.
+
+Usage:
+	depscan [PROJECT_ROOT]
+
+Notes:
+	- Requires gopls installed and a valid Go module workspace (go.mod).
+	- If gopls isn't available or errors occur, the script will still list methods
+	it found, and report the error per method.
+	- By default, test files (*_test.go) are excluded from functions and caller expansion.
+		Use --include-tests to include them.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from collections.abc import Iterable, Sequence
+from typing import Callable
+import argparse
+import shutil
+import builtins
+import time
+
+
+GRPC_FILE_SUFFIX = "_grpc.pb.go"
+
+
+def find_module_root(start: Path) -> Path | None:
+	"""Walk up from start to find go.mod, returning its directory."""
+	cur = start.resolve()
+	if cur.is_file():
+		cur = cur.parent
+	for p in [cur, *cur.parents]:
+		if (p / "go.mod").exists():
+			return p
+	return None
+
+
+def iter_grpc_files(root: Path) -> Iterable[Path]:
+	for p in root.rglob(f"*{GRPC_FILE_SUFFIX}"):
+		if p.is_file():
+			yield p
+
+
+def extract_client_methods(go_file: Path) -> list[tuple[str, int, int]]:
+	"""Extract client method names and their position (line, col 1-based).
+
+	We look for receiver methods whose receiver type ends with 'Client', e.g.:
+	  func (c *eventProcessorServiceV1Client) GetSessionRules(ctx context.Context, ...)
+
+	Returns list of (method_name, line, col).
+	"""
+	methods: list[tuple[str, int, int]] = []
+	# The regex ended up too complex, use a simpler form and parse per line.
+	rx = re.compile(r"^func\s*\(.*\*\s*([A-Za-z0-9_]+)\s*\)\s+([A-Za-z0-9_]+)\s*\(")
+	lines = go_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+	for i, line in enumerate(lines, start=1):
+		line_stripped = line.strip()
+		if not line_stripped.startswith("func "):
+			continue
+		# Quick reject: must have receiver parens
+		if not line_stripped.startswith("func ("):
+			continue
+		# Try to capture receiver type and method name
+		# Example: func (c *eventProcessorServiceV1Client) GetSessionRules(
+		m = re.match(r"^func\s*\(.*\*\s*([A-Za-z0-9_]+)\s*\)\s+([A-Za-z0-9_]+)\s*\(", line)
+		if not m:
+			continue
+		recv_type, method = m.group(1), m.group(2)
+		if not recv_type.endswith("Client"):
+			continue
+		col = line.find(method)
+		if col == -1:
+			continue
+		methods.append((method, i, col + 1))  # 1-based column
+	# Deduplicate by method name (prefer first occurrence)
+	seen: set[str] = set()
+	uniq: list[tuple[str, int, int]] = []
+	for m in methods:
+		if m[0] in seen:
+			continue
+		seen.add(m[0])
+		uniq.append(m)
+	return uniq
+
+
+def run_gopls_references(file: Path, line: int, col: int, cwd: Path, gopls_args: Sequence[str] | None = None) -> tuple[list[dict] | None, str | None]:
+	"""Run `gopls references` at a specific position. Returns (result, error).
+
+	The result is a list of dicts possibly containing 'uri' and 'range' with
+	LSP-style positions. We will normalize later.
+	"""
+	pos = f"{file}:{line}:{col}"
+	try:
+		# Try JSON output first - some gopls versions support -json flag.
+		base = ["gopls", *([*gopls_args] if gopls_args else [])]
+		proc = subprocess.run(
+			[*base, "references", "-json", pos],
+			cwd=str(cwd),
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			check=False,
+		)
+		out = proc.stdout.strip()
+		if proc.returncode != 0:
+			# Some versions don't support -json; try without and parse lines if possible.
+			proc2 = subprocess.run(
+				[*base, "references", pos],
+				cwd=str(cwd),
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE,
+				text=True,
+				check=False,
+			)
+			if proc2.returncode != 0:
+				return None, proc2.stderr.strip() or proc.stderr.strip() or f"gopls exited {proc2.returncode}"
+			# Fallback: parse plain text lines that may contain paths like /path/file.go:line:col-...
+			refs: list[dict] = []
+			for ln in proc2.stdout.splitlines():
+				ln = ln.strip()
+				if not ln:
+					continue
+				# Expected formats like: /abs/path/file.go:LINE:COL-... or /abs/path/file.go:LINE:COL
+				m = re.match(r"^(/[^:]+):(\d+):(\d+)", ln)
+				if m:
+					pth = m.group(1)
+					if os.path.exists(pth):
+						refs.append({
+							"uri": Path(pth).resolve().as_uri(),
+							"range": {"start": {"line": int(m.group(2)) - 1, "character": int(m.group(3)) - 1}}
+						})
+				else:
+					# Accept prefix until first ':' as path if it's an existing file
+					path_candidate = ln.split(":", 1)[0]
+					if os.path.isabs(path_candidate) and os.path.exists(path_candidate):
+						refs.append({"uri": Path(path_candidate).resolve().as_uri()})
+			return refs, None
+		# Parse JSON; handle either an array or newline-delimited JSON objects
+		try:
+			data = json.loads(out)
+			if isinstance(data, list):
+				return data, None
+			# If it's a dict, wrap in list
+			return [data], None
+		except json.JSONDecodeError:
+			refs: list[dict] = []
+			for ln in out.splitlines():
+				ln = ln.strip()
+				if not ln:
+					continue
+				try:
+					obj = json.loads(ln)
+					refs.append(obj)
+				except json.JSONDecodeError:
+					continue
+			if refs:
+				return refs, None
+			return None, proc.stderr.strip() or "failed to parse gopls JSON output"
+	except FileNotFoundError:
+		return None, "gopls not found in PATH"
+
+
+def uri_to_path(uri: str) -> Path | None:
+	try:
+		if uri.startswith("file://"):
+			return Path(os.path.abspath(Path(uri[7:]).as_posix()))
+		# Sometimes gopls returns plain paths
+		p = Path(uri)
+		if p.exists():
+			return p.resolve()
+	except Exception:
+		pass
+	return None
+
+
+def collect_package_dirs(paths: Iterable[Path]) -> set[Path]:
+	return {p.parent.resolve() for p in paths}
+
+
+def rel_package_names(pkg_dirs: set[Path], module_root: Path | None) -> list[str]:
+	items: list[str] = []
+	for d in sorted(pkg_dirs):
+		if module_root and module_root in d.parents or d == module_root:
+			items.append(str(d.relative_to(module_root)))
+		else:
+			items.append(str(d))
+	return items
+
+
+def enclosing_function_name(file_path: Path, ref_line_1based: int) -> str | None:
+	"""Find the nearest enclosing function name at or above the given 1-based line.
+
+	Returns None if not found, or "func-literal" if the nearest is an unnamed function literal.
+	"""
+	try:
+		lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+	except Exception:
+		return None
+	# Match beginning-of-line 'func', optional receiver '(...)', optional name, then '('
+	func_re = re.compile(r"^func\s*(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)?\s*\(")
+	# Correct pattern (no stray quotes)
+	func_re = re.compile(r"^func\s*(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)?\s*\(")
+	# Final clean pattern (no quotes at end)
+	func_re = re.compile(r"^func\s*(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)?\s*\(")
+	for i in range(min(len(lines), max(1, ref_line_1based)) - 1, -1, -1):
+		line = lines[i].lstrip()
+		if not line.startswith("func "):
+			continue
+		# Use a simpler direct check to avoid any regex quoting mistakes
+		m = re.match(r"^func\s*(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)?\s*\(", line)
+		if m:
+			name = m.group(1)
+			if name:
+				return name
+			else:
+				return "func-literal"
+	return None
+
+
+def find_function_def_positions(root: Path, func_name: str, include_tests: bool = False) -> list[tuple[Path, int, int]]:
+	"""Find positions (file, line, col 1-based) of top-level function declarations named func_name.
+
+	We scan *.go files and look for lines like:
+	  func FuncName(
+	  func (r *Receiver) FuncName(
+	"""
+	positions: list[tuple[Path, int, int]] = []
+	decl_re = re.compile(r"^func\s*(?:\([^)]*\)\s*)?(%s)\s*\(" % re.escape(func_name))
+	for gof in root.rglob("*.go"):
+		# Skip test files unless explicitly requested
+		if not include_tests and gof.name.endswith("_test.go"):
+			continue
+		try:
+			text = gof.read_text(encoding="utf-8", errors="ignore")
+		except Exception:
+			continue
+		for i, line in enumerate(text.splitlines(), start=1):
+			m = decl_re.match(line)
+			if not m:
+				continue
+			col = line.find(func_name)
+			if col >= 0:
+				positions.append((gof, i, col + 1))
+	return positions
+
+
+def find_callers_of_function(search_root: Path, func_name: str, cwd: Path, include_tests: bool = False, gopls_args: Sequence[str] | None = None, progress_cb: Callable[[float], None] | None = None) -> set[tuple[Path, int | None]]:
+	"""Use gopls to find references to a function by name and return positions (file, line) of callers.
+
+	We locate all definitions of func_name, then run `gopls references` on each, aggregate references,
+	and return unique positions of references that are not the definition locations.
+	"""
+	callers: set[tuple[Path, int | None]] = set()
+	def_positions = find_function_def_positions(search_root, func_name, include_tests=include_tests)
+	# progress across definition sites
+	m_total = max(len(def_positions), 1)
+	if progress_cb:
+		try:
+			progress_cb(0.0)
+		except Exception:
+			pass
+	for idx, (file, line, col) in enumerate(def_positions):
+		if progress_cb:
+			try:
+				progress_cb(min(1.0, idx / m_total))
+			except Exception:
+				pass
+		refs, _err = run_gopls_references(file, line, col, cwd=cwd, gopls_args=gopls_args)
+		if not refs:
+			continue
+		# Convert to (path, line)
+		ref_paths: list[tuple[Path, int | None]] = []
+		for j, r in enumerate(refs):
+			if not isinstance(r, dict):
+				continue
+			uri = r.get("uri") or r.get("URI")
+			if isinstance(uri, dict):
+				uri = uri.get("uri")
+			if not uri:
+				continue
+			p = uri_to_path(str(uri))
+			if p is None:
+				continue
+			# Skip test files unless requested
+			if not include_tests and p.name.endswith("_test.go"):
+				continue
+			lnum: int | None = None
+			if isinstance(r.get("range"), dict):
+				try:
+					lnum = int(r["range"]["start"]["line"]) + 1
+				except Exception:
+					lnum = None
+			# Skip exact definition position
+			if p == file and lnum == line:
+				continue
+			ref_paths.append((p, lnum))
+			# update nested progress within this definition based on processed refs
+			if progress_cb:
+				try:
+					step = (j + 1) / max(len(refs) or 1, 1)
+					progress_cb(min(1.0, (idx + step) / m_total))
+				except Exception:
+					pass
+		# For each reference, collect the position (caller site)
+		for p, lnum in ref_paths:
+			callers.add((p, lnum if lnum else 1))
+		# ensure we advance to end of this definition slice
+		if progress_cb:
+			try:
+				progress_cb(min(1.0, (idx + 1) / m_total))
+			except Exception:
+				pass
+	# if no definitions, mark as done
+	if not def_positions and progress_cb:
+		try:
+			progress_cb(1.0)
+		except Exception:
+			pass
+	return callers
+
+
+def parse_fqfn_for_location(file_path: Path, ref_line_1based: int, import_path_by_dir: dict[Path, str] | None = None,
+							module_root: Path | None = None, module_path: str | None = None) -> str | None:
+	"""Compute a fully-qualified Go function name at a given file and line.
+
+	Format:
+	  - For functions: <import_path_or_pkg>.<Func>
+	  - For methods:  <import_path_or_pkg>.(<*Type|Type>).<Method>
+	"""
+	try:
+		text = file_path.read_text(encoding="utf-8", errors="ignore")
+	except Exception:
+		return None
+	lines = text.splitlines()
+	# Find package name at top
+	pkg_name = None
+	for i in range(min(50, len(lines))):
+		s = lines[i].strip()
+		if s.startswith("package "):
+			pkg_name = s.split()[1]
+			break
+	# Find function declaration line by scanning backwards
+	func_decl = None
+	func_name = None
+	recv_sig = None
+	func_re = re.compile(r"^func\s*(?:\((?P<recv>[^)]*)\)\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(")
+	for i in range(min(len(lines), max(1, ref_line_1based)) - 1, -1, -1):
+		line = lines[i].lstrip()
+		if not line.startswith("func "):
+			continue
+		m = re.match(r"^func\s*(?:\((?P<recv>[^)]*)\)\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+		if not m:
+			continue
+		func_decl = i + 1  # 1-based
+		func_name = m.group("name")
+		recv_sig = m.group("recv")
+		break
+	if not func_name:
+		return None
+	# Determine import path
+	dir_path = file_path.parent.resolve()
+	import_path = None
+	if import_path_by_dir and dir_path in import_path_by_dir:
+		import_path = import_path_by_dir.get(dir_path)
+	elif module_root and module_path:
+		try:
+			rel = dir_path.relative_to(module_root)
+			import_path = f"{module_path}/{str(rel).replace(os.sep, '/')}" if str(rel) else module_path
+		except Exception:
+			pass
+	# Shorten import path by removing the module path prefix so output is module-relative
+	import_path_short: str | None = import_path
+	if import_path and module_path:
+		if import_path == module_path:
+			import_path_short = ""  # root package; will fallback to pkg name below
+		elif import_path.startswith(module_path + "/"):
+			import_path_short = import_path[len(module_path) + 1:]
+	# Fallback to package name if shortened path is empty or unavailable
+	pkg_or_path = (import_path_short if import_path_short else None) or (pkg_name or "")
+	# Receiver formatting
+	if recv_sig:
+		# Receiver examples: "r *Type", "t Type", "*pkg.Type"
+		parts = recv_sig.strip().split()
+		recv_type = parts[-1] if parts else recv_sig.strip()
+		ptr = recv_type.startswith("*")
+		recv_type = recv_type.lstrip("*")
+		# Drop any package qualifier in the receiver type itself
+		if "." in recv_type:
+			recv_type = recv_type.split(".")[-1]
+		recv_fmt = f"(*{recv_type})" if ptr else f"({recv_type})"
+		return f"{pkg_or_path}.{recv_fmt}.{func_name}"
+	else:
+		return f"{pkg_or_path}.{func_name}"
+
+
+def main(argv: Sequence[str]) -> int:
+	parser = argparse.ArgumentParser(description="Find *_grpc.pb.go methods and list direct and transitive consumers")
+	parser.add_argument("root", nargs="?", default=str(Path.cwd()), help="Project root to scan (defaults to current working directory)")
+	parser.add_argument("--segments", "-n", type=int, default=1, help="Number of leading path segments to show for transitive consumers (default: 1)")
+	parser.add_argument("--format", choices=["table", "tsv"], default="table", help="Summary output format: table (unicode) or tsv (default: table)")
+	parser.add_argument(
+		"--expand-top-level-pkg",
+		nargs="+",
+		default=["pkg"],
+		help="One or more top-level directories whose functions should be replaced by their callers (default: pkg)",
+	)
+	parser.add_argument(
+		"--include-tests",
+		action="store_true",
+		help="Include test files (*_test.go) and their functions when listing functions and expanding callers (default: excluded)",
+	)
+	parser.add_argument(
+		"--no-progress",
+		action="store_true",
+		help="Disable progress bar while scanning (enabled by default)",
+	)
+	parser.add_argument(
+		"--consumer-source",
+		choices=["functions", "imports"],
+		default="functions",
+		help="How to fill the Consumer column in the summary: from functions' package path (functions) or import graph (imports). Default: functions",
+	)
+	parser.add_argument(
+		"--gopls-remote",
+		help="Pass -remote=<addr> to gopls to reuse a shared daemon/cache (e.g., tcp://127.0.0.1:3737). Implies --gopls-remote-auto if empty.",
+		nargs="?",
+		const="auto",
+		default=None,
+	)
+	parser.add_argument(
+		"--debug-expand",
+		action="store_true",
+		help="Print debug information about expansion (dropping top-level functions and skipping top-level callers)",
+	)
+	args = parser.parse_args(list(argv[1:]))
+
+	root_arg = Path(args.root).resolve()
+	module_root = find_module_root(root_arg)
+	search_root = module_root or root_arg
+
+	# Build package import graph once (best effort)
+	importers_by_dir: dict[Path, set[Path]] = {}
+	dir_by_import_path: dict[str, Path] = {}
+	module_path: str | None = None
+	try:
+		# Discover module path (optional)
+		mod_proc = subprocess.run(
+			["go", "list", "-m", "-json"],
+			cwd=str(search_root),
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			check=False,
+		)
+		if mod_proc.returncode == 0 and mod_proc.stdout.strip():
+			try:
+				mod_info = json.loads(mod_proc.stdout)
+				module_path = mod_info.get("Path")
+			except json.JSONDecodeError:
+				module_path = None
+	except FileNotFoundError:
+		module_path = None
+
+	def parse_multi_json(stream: str) -> Iterable[dict]:
+		buf = []
+		depth = 0
+		in_str = False
+		esc = False
+		for ch in stream:
+			buf.append(ch)
+			if ch == '"' and not esc:
+				in_str = not in_str
+			if in_str:
+				esc = (ch == '\\' and not esc)
+				continue
+			if ch == '{':
+				depth += 1
+			elif ch == '}':
+				depth -= 1
+				if depth == 0:
+					obj_str = ''.join(buf).strip()
+					buf = []
+					try:
+						obj = json.loads(obj_str)
+						yield obj
+					except json.JSONDecodeError:
+						continue
+			esc = False
+
+	try:
+		gl = subprocess.run(
+			["go", "list", "-json", "./..."],
+			cwd=str(search_root),
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			check=False,
+		)
+		if gl.returncode == 0 and gl.stdout:
+			# Index packages by ImportPath and Dir
+			packages: list[dict] = list(parse_multi_json(gl.stdout))
+			for pkg in packages:
+				imp = pkg.get("ImportPath")
+				d = pkg.get("Dir")
+				if not imp or not d:
+					continue
+				d_path = Path(d).resolve()
+				dir_by_import_path[imp] = d_path
+			# Also build reverse mapping: dir -> import path
+			import_path_by_dir: dict[Path, str] = {v: k for k, v in dir_by_import_path.items()}
+			# Build reverse import graph: imported dir -> set(importer dirs)
+			for pkg in packages:
+				imp = pkg.get("ImportPath")
+				d = pkg.get("Dir")
+				if not imp or not d:
+					continue
+				d_path = Path(d).resolve()
+				imports = pkg.get("Imports") or []
+				# Optionally include TestImports? Keep it simple: only regular imports
+				for imported in imports:
+					imported_dir = dir_by_import_path.get(imported)
+					if not imported_dir:
+						continue  # skip stdlib or external modules
+					importers_by_dir.setdefault(imported_dir, set()).add(d_path)
+	except FileNotFoundError:
+		pass  # 'go' not found; transitive consumers will be unavailable
+
+	grpc_files = list(iter_grpc_files(search_root))
+	if not grpc_files:
+		print(f"No '*{GRPC_FILE_SUFFIX}' files found under {search_root}")
+		return 0
+
+	# Pre-scan to count total methods for progress bar and cache per-file methods
+	# Prepare gopls extra args (remote cache reuse)
+	gopls_extra: list[str] = []
+	if args.gopls_remote is not None:
+		if args.gopls_remote == "auto":
+			gopls_extra.extend(["-remote=auto"])
+		elif isinstance(args.gopls_remote, str) and args.gopls_remote:
+			gopls_extra.extend([f"-remote={args.gopls_remote}"])
+	files_methods: dict[Path, list[tuple[str, int, int]]] = {}
+	for gf in grpc_files:
+		try:
+			files_methods[gf] = extract_client_methods(gf)
+		except Exception:
+			files_methods[gf] = []
+
+	# Total methods across files for progress tracking
+	total_methods = sum(len(v) for v in files_methods.values())
+
+	# Setup progress bar utilities (no external deps)
+	progress_enabled = (not args.no_progress) and total_methods > 0 and sys.stdout.isatty()
+	progress_current = 0
+	progress_sub_ratio = 0.0  # 0..1 sub-progress within current method for granular updates
+	progress_start = time.time()
+
+	def _term_width() -> int:
+		try:
+			return max(40, shutil.get_terminal_size(fallback=(80, 20)).columns)
+		except Exception:
+			return 80
+
+	def _format_eta(elapsed: float, done: int, total: int) -> str:
+		if done <= 0 or elapsed <= 0:
+			return "--:--"
+		rate = done / max(elapsed, 1e-6)
+		remain = max(total - done, 0)
+		eta_sec = int(remain / max(rate, 1e-9))
+		m, s = divmod(eta_sec, 60)
+		if m >= 60:
+			H, m = divmod(m, 60)
+			return f"{H:d}:{m:02d}:{s:02d}"
+		return f"{m:02d}:{s:02d}"
+
+	def _draw_progress():
+		if not progress_enabled:
+			return
+		width = _term_width()
+		bar_width = max(10, min(40, width - 30))
+		ratio_total = 1.0 if total_methods == 0 else min(1.0, (progress_current + progress_sub_ratio) / total_methods)
+		# Build bar with partial cell resolution (1/8 increments)
+		full_cells = int(bar_width * ratio_total)
+		rem = (bar_width * ratio_total) - full_cells
+		partial_char = ""
+		# Map remainder to left block partials (1/8..7/8)
+		if rem >= 7/8:
+			partial_char = "▉"
+		elif rem >= 6/8:
+			partial_char = "▊"
+		elif rem >= 5/8:
+			partial_char = "▋"
+		elif rem >= 4/8:
+			partial_char = "▌"
+		elif rem >= 3/8:
+			partial_char = "▍"
+		elif rem >= 2/8:
+			partial_char = "▎"
+		elif rem >= 1/8:
+			partial_char = "▏"
+		bar_body = "█" * full_cells
+		if partial_char and (full_cells < bar_width):
+			bar_body += partial_char
+			pad = bar_width - full_cells - 1
+		else:
+			pad = bar_width - full_cells
+		bar = "[" + bar_body + (" " * max(0, pad)) + "]"
+		elapsed = time.time() - progress_start
+		eta = _format_eta(elapsed, progress_current + progress_sub_ratio, total_methods)
+		percent = int(ratio_total * 100)
+		msg = f" {percent:3d}% | {progress_current}/{total_methods} | ETA {eta} "
+		line = (bar + msg)
+		# Truncate if needed
+		if len(line) > width - 1:
+			line = line[: max(0, width - 1)]
+		sys.stdout.write("\r" + line)
+		sys.stdout.flush()
+
+	def _clear_progress_line():
+		if not progress_enabled:
+			return
+		width = _term_width()
+		sys.stdout.write("\r" + (" " * (width - 1)) + "\r")
+		sys.stdout.flush()
+
+	def _update_sub(r: float):
+		# Clamp and update sub-progress for the current method, then redraw
+		nonlocal progress_sub_ratio
+		if not progress_enabled:
+			return
+		try:
+			progress_sub_ratio = 0.0 if r <= 0 else (1.0 if r >= 1 else float(r))
+		except Exception:
+			progress_sub_ratio = 0.0
+		_draw_progress()
+
+	# Monkey-patch print to play nice with progress line
+	builtins._orig_print = builtins.print  # type: ignore[attr-defined]
+	def _safe_print(*a, **k):
+		if progress_enabled:
+			_clear_progress_line()
+		builtins._orig_print(*a, **k)
+		if progress_enabled:
+			_draw_progress()
+	if progress_enabled:
+		builtins.print = _safe_print  # type: ignore[assignment]
+
+	base_root = module_root or search_root
+
+	# Collect rows for summary: (package, method, consumer_segment, [functions])
+	summary_rows: list[tuple[str, str, str, list[str]]] = []
+
+	def truncate_segment_from_dir(d: Path) -> str:
+		# make path relative
+		if base_root and (base_root in d.parents or d == base_root):
+			rel = str(d.relative_to(base_root))
+		else:
+			rel = str(d)
+		parts = [p for p in rel.split(os.sep) if p]
+		if not parts:
+			return rel
+		n = max(1, int(args.segments))
+		return os.sep.join(parts[:n])
+
+
+
+	# Initial draw
+	_draw_progress()
+
+	for go_file in grpc_files:
+		print(f"\nFile: {go_file}")
+		methods = files_methods.get(go_file, [])
+		if not methods:
+			print("  No client methods found (receiver *...Client).")
+			continue
+		# Determine service base for pretty name, e.g., proxy_manager from proxy_manager_v1
+		service_dir_name = go_file.parent.name
+		service_base = re.sub(r"_v\d+$", "", service_dir_name)
+		if not service_base:
+			service_base = service_dir_name
+
+		for method, line, col in methods:
+			# Initialize sub-progress for this method
+			_update_sub(0.0)
+			refs_raw, err = run_gopls_references(go_file, line, col, cwd=search_root, gopls_args=gopls_extra)
+			_update_sub(0.15)
+			if err:
+				print(f"  Method {method}: (gopls error: {err})")
+				# Count this method as processed
+				_update_sub(1.0)
+				progress_current += 1
+				progress_sub_ratio = 0.0
+				_draw_progress()
+				continue
+			# refs is a list of locations; structure may vary. Try to read uri fields.
+			ref_paths: list[tuple[Path, int | None, int | None]] = []
+			for r in refs_raw or []:
+				uri = None
+				if isinstance(r, dict):
+					uri = r.get("uri") or r.get("URI")
+					if isinstance(uri, dict):
+						uri = uri.get("uri")
+				if not uri:
+					continue
+				p = uri_to_path(str(uri))
+				if p is None:
+					continue
+				# Skip test references unless tests are explicitly included
+				if not args.include_tests and p.name.endswith("_test.go"):
+					continue
+				# Try to get 1-based line/col from LSP range if present
+				lnum: int | None = None
+				cnum: int | None = None
+				if isinstance(r, dict) and isinstance(r.get("range"), dict):
+					try:
+						lnum = int(r["range"]["start"]["line"]) + 1
+						cnum = int(r["range"]["start"]["character"]) + 1
+					except Exception:
+						lnum = None
+						cnum = None
+				ref_paths.append((p, lnum, cnum))
+				# small sub-progress bump while iterating refs
+				if total_methods > 0:
+					_update_sub(min(0.35 + 0.15 * (len(ref_paths) % 7) / 7.0, 0.50))
+			_update_sub(0.35)
+			# Exclude the defining file's directory
+			def_dir = go_file.parent.resolve()
+			only_paths = [rp[0] for rp in ref_paths]
+			pkg_dirs = {d for d in collect_package_dirs(only_paths) if d != def_dir}
+			pkgs = rel_package_names(pkg_dirs, module_root)
+			print(f"  Method {method}:")
+			if not pkgs:
+				print("    referenced in: (none outside defining package)")
+			else:
+				for pkg in pkgs:
+					print(f"    referenced in: {pkg}")
+
+			# Transitive consumers: packages that import the directly-referencing packages
+			# Build only if go list data was available
+			consumer_dirs: set[Path] = set()
+			if importers_by_dir:
+				# BFS over importers
+				queue: list[Path] = list(pkg_dirs)
+				visited: set[Path] = set()
+				consumers: set[Path] = set()
+				while queue:
+					cur = queue.pop(0)
+					if cur in visited:
+						continue
+					visited.add(cur)
+					for imp_dir in importers_by_dir.get(cur, set()):
+						if imp_dir not in visited:
+							consumers.add(imp_dir)
+							queue.append(imp_dir)
+
+				# exclude direct packages themselves
+				consumers -= pkg_dirs
+				consumer_dirs = consumers
+
+				# Truncate to first N path segments relative to module root
+				trunc: set[str] = set()
+				for d in consumers:
+					seg = truncate_segment_from_dir(d)
+					if seg:
+						trunc.add(seg)
+				if trunc:
+					for seg in sorted(trunc):
+						print(f"    consumed by: {seg}")
+				else:
+					print("    consumed by: (no importers found)")
+				_update_sub(0.55)
+			else:
+				print("    consumed by: (unavailable - 'go list' not usable)")
+
+			# Build summary rows: group by consumer segment and list functions that directly reference the method
+			# First, gather all unique function FQFNs from direct references
+			fnames_all: set[str] = set()
+			fn_positions: list[tuple[Path, int]] = []  # keep positions to optionally expand by callers
+			origin_entries: list[tuple[Path, int | None, str, str]] = []  # (file, line, fqfn, simple_name)
+			names_by_file: dict[Path, set[str]] = {}
+			for (p, lnum, _c) in ref_paths:
+				pkg_dir = p.parent.resolve()
+				if pkg_dir == def_dir:
+					continue
+				fqfn = parse_fqfn_for_location(
+					p, lnum if lnum else 1,
+					import_path_by_dir=locals().get('import_path_by_dir'),
+					module_root=module_root,
+					module_path=module_path,
+				)
+				fname = fqfn or (enclosing_function_name(p, lnum if lnum else 1) or "(unknown)")
+				fnames_all.add(fname)
+				names_by_file.setdefault(p, set()).add(fname)
+				if lnum:
+					fn_positions.append((p, lnum))
+				# derive simple function name for expansion regardless of lnum
+				if fqfn:
+					simple_name = fqfn.split('.')[-1]
+				else:
+					simple_name = (enclosing_function_name(p, lnum if lnum else 1) or "")
+				origin_entries.append((p, lnum, fqfn or fname, simple_name))
+				# minor sub-progress while building function names
+				if total_methods > 0:
+					_update_sub(min(0.50 + 0.10 * (len(fnames_all) % 5) / 5.0, 0.60))
+
+			# If a consuming function has the same name as the consumed method, expand it to its callers
+			# e.g., if method == "GetSecret" and we saw a function named "GetSecret", replace that entry with
+			# the list of callers of GetSecret across the workspace.
+			# FQFN comparison needs just the bare method name; drop any FQFNs that end with ".{method}"
+			to_drop = {n for n in fnames_all if n.split('.')[-1] == method}
+			if to_drop:
+				fnames_all -= to_drop
+				# nested sub-progress: allocate 0.60..0.72 for this expansion
+				def _cb1(r: float):
+					_update_sub(0.60 + 0.12 * max(0.0, min(1.0, r)))
+				call_sites = find_callers_of_function(
+					search_root, method, cwd=search_root,
+					include_tests=args.include_tests, gopls_args=gopls_extra, progress_cb=_cb1,
+				)
+				if call_sites:
+					for (cp, cln) in call_sites:
+						cfqfn = parse_fqfn_for_location(
+							cp, cln if cln else 1,
+							import_path_by_dir=locals().get('import_path_by_dir'),
+							module_root=module_root,
+							module_path=module_path,
+						)
+						if cfqfn:
+							# Skip adding callers that reside in top-level dirs (e.g., pkg) to avoid reintroducing them
+							try:
+								rel_cp = cp.resolve().relative_to((module_root or search_root).resolve())
+								parts_cp = rel_cp.parts
+								is_top_level = len(parts_cp) >= 2 and parts_cp[0] in (args.expand_top_level_pkg or []) and parts_cp[1]
+							except Exception:
+								is_top_level = False
+							if is_top_level:
+								if args.debug_expand:
+									print(f"      [debug-expand] skip top-level caller: {cfqfn} (from {rel_cp})")
+								continue
+							fnames_all.add(cfqfn)
+
+			# Option: expand any functions in specified top-level directories (default: ['pkg']) to their callers
+			# Extend to work even when we don't have line numbers from gopls.
+			if args.expand_top_level_pkg and origin_entries:
+				expanded: set[str] = set()
+				originals_to_remove: set[str] = set()
+				for (fp, fln, fqfn_orig, simple_name) in origin_entries:
+					# Check if path is in base_root/<dir>/<something> where <dir> is in the provided list
+					try:
+						rel = fp.resolve().relative_to(base_root.resolve())
+					except Exception:
+						continue
+					parts = rel.parts
+					if len(parts) >= 2 and parts[0] in args.expand_top_level_pkg and parts[1]:
+						# Remove all names originating from this file to avoid FQFN mismatches
+						file_names = names_by_file.get(fp, set())
+						for n in file_names:
+							originals_to_remove.add(n)
+						if args.debug_expand:
+							print(f"      [debug-expand] dropping {len(file_names)} name(s) from top-level '{parts[0]}' file: {rel}")
+							for n in sorted(file_names):
+								print(f"      [debug-expand]   - {n}")
+						# Derive function name to search callers for
+						fname_local = simple_name or (enclosing_function_name(fp, fln or 1) or None)
+						if not fname_local:
+							continue
+						# Gather callers for this function name with nested progress 0.68..0.78
+						def _cb2(r: float):
+							_update_sub(0.68 + 0.10 * max(0.0, min(1.0, r)))
+						call_sites = find_callers_of_function(
+							search_root, fname_local, cwd=search_root,
+							include_tests=args.include_tests, gopls_args=gopls_extra, progress_cb=_cb2,
+						)
+						for (cp, cln) in call_sites:
+							cfqfn = parse_fqfn_for_location(
+								cp, cln if cln else 1,
+								import_path_by_dir=locals().get('import_path_by_dir'),
+								module_root=module_root,
+								module_path=module_path,
+							)
+							if cfqfn:
+								# Skip callers that also reside under top-level dirs to avoid reintroducing
+								try:
+									rel_cp = cp.resolve().relative_to((module_root or search_root).resolve())
+									is_top = len(rel_cp.parts) >= 2 and rel_cp.parts[0] in (args.expand_top_level_pkg or []) and rel_cp.parts[1]
+								except Exception:
+									is_top = False
+								if is_top:
+									if args.debug_expand:
+										print(f"      [debug-expand] skip top-level caller: {cfqfn} (from {rel_cp})")
+									continue
+								expanded.add(cfqfn)
+								if args.debug_expand:
+									print(f"      [debug-expand] add caller: {cfqfn}")
+				# Replace any functions that originated from top-level pkg with their callers
+				if originals_to_remove:
+					fnames_all -= originals_to_remove
+				if expanded:
+					fnames_all |= expanded
+			_update_sub(0.80)
+
+			# Print functions in the scanning phase (3rd column content), now as FQFNs
+
+			# bump before printing
+			_update_sub(0.90)
+			if not fnames_all:
+				print("    functions: (none)")
+			else:
+				print("    functions:")
+				for fn in sorted(fnames_all):
+					print(f"      {fn}")
+
+			pkg_for_method = service_base
+			qualified_method = f"{pkg_for_method}.{method}"
+			# Build summary rows regardless of consumer_dirs, so unused methods are shown
+			if args.consumer_source == "functions":
+				# Derive consumer segment from function FQFNs (first import path segment)
+				def consumer_from_fn(fn: str) -> str:
+					# fn looks like: path/to/pkg.(Type).Func or path/to/pkg.Func
+					pkg_path = fn.split(".", 1)[0]
+					first_seg = pkg_path.split("/", 1)[0] if "/" in pkg_path else pkg_path
+					return first_seg or "(unknown)"
+				if not fnames_all:
+					summary_rows.append((pkg_for_method, method, "(not used)", []))
+				else:
+					by_cons: dict[str, list[str]] = {}
+					for fn in sorted(fnames_all):
+						c = consumer_from_fn(fn)
+						by_cons.setdefault(c, []).append(fn)
+					for seg, fns in sorted(by_cons.items(), key=lambda kv: kv[0]):
+						summary_rows.append((pkg_for_method, method, seg, fns))
+			else:
+				# Use import graph-derived consumers
+				if not importers_by_dir:
+					# Import graph unavailable
+					summary_rows.append((pkg_for_method, method, "(consumers unavailable)", sorted(fnames_all)))
+				else:
+					if not pkg_dirs:
+						# No direct references -> not used
+						summary_rows.append((pkg_for_method, method, "(not used)", sorted(fnames_all)))
+					else:
+						if consumer_dirs:
+							consumer_segs = sorted({truncate_segment_from_dir(d) for d in consumer_dirs if d})
+							if not consumer_segs:
+								consumer_segs = ["(no importers)"]
+							for seg in consumer_segs:
+								summary_rows.append((pkg_for_method, method, seg, sorted(fnames_all)))
+						else:
+							# Direct references exist (pkg_dirs) but no importers found
+							summary_rows.append((pkg_for_method, method, "(no importers)", sorted(fnames_all)))
+
+			# Update progress per-method
+			_update_sub(1.0)
+			progress_current += 1
+			progress_sub_ratio = 0.0
+			_draw_progress()
+	# Render summary
+	if summary_rows:
+		# Clear progress before final output block
+		_clear_progress_line()
+		if args.format == "tsv":
+			# Columns: Package	Method	Consumer	Functions (comma separated)
+			for pkg_name, meth_name, seg, fnames in summary_rows:
+				funcs = ",".join(fnames) if fnames else ""
+				print(f"{pkg_name}\t{meth_name}\t{seg}\t{funcs}")
+		else:
+			# Unicode table
+			headers = ["Package", "Method", "Consumer", "Functions"]
+			# Build rows grouped by package for visual separation
+			rows_full: list[tuple[str, list[str]]] = []  # (package, row)
+			for pkg_name, meth_name, seg, fnames in summary_rows:
+				func_cell = "\n".join(fnames) if fnames else ""
+				seg_norm = seg if seg != "(consumers unavailable)" else "(not used)"
+				rows_full.append((pkg_name, [pkg_name, meth_name, seg_norm, func_cell]))
+
+			# Sort by package then method then consumer for stable grouping
+			rows_full.sort(key=lambda pr: (pr[0], pr[1][1], pr[1][2]))
+			rows = [r for _, r in rows_full]
+
+			# Compute column widths using per-cell max line length to avoid multi-line cells inflating width
+			def cell_display_width(val: str) -> int:
+				s = str(val)
+				if "\n" in s:
+					parts = s.splitlines()
+					return max((len(p) for p in parts), default=0)
+				return len(s)
+
+			widths: list[int] = [0, 0, 0, 0]
+			for i in range(len(headers)):
+				widths[i] = max(widths[i], cell_display_width(headers[i]))
+			for _, row in rows_full:
+				for i in range(len(row)):
+					w = cell_display_width(row[i])
+					if w > widths[i]:
+						widths[i] = w
+
+			def hline(left: str, mid: str, right: str, fill: str) -> str:
+				parts = [fill * (w + 2) for w in widths]
+				return left + mid.join(parts) + right
+
+			top = hline("┌", "┬", "┐", "─")
+			sep = hline("├", "┼", "┤", "─")
+			bot = hline("└", "┴", "┘", "─")
+
+			def render_row(cells: list[str]) -> str:
+				padded = [f" {str(cells[i]).ljust(widths[i])} " for i in range(len(widths))]
+				return "│" + "│".join(padded) + "│"
+
+			print("\n" + top)
+			print(render_row(headers))
+			print(sep)
+
+			# Build a partial separator that spans only columns 2..N (skip package col)
+			def partial_sep_from_col(col_start: int = 1) -> str:
+				# Start with left border
+				line = "│"
+				# For skipped columns before the span, add spaces and vertical borders,
+				# but do NOT add the border before the starting column; we will place a joint there instead.
+				for i in range(0, max(0, col_start)):
+					line += " " * (widths[i] + 2)
+					# Add a vertical border only if this is not the border adjacent to the start column
+					if i < col_start - 1:
+						line += "│"
+				# Now draw the partial separator starting at col_start
+				if col_start < len(widths):
+					# Joint at the boundary between skipped and spanned columns
+					line += "├"
+					line += "─" * (widths[col_start] + 2)
+					# Middle joints for subsequent columns in the span
+					for j in range(col_start + 1, len(widths)):
+						line += "┼" + ("─" * (widths[j] + 2))
+					# Close against right border
+					line += "┤"
+				return line
+
+			# Iterate with index to look ahead/behind for grouping behavior
+			for idx in range(len(rows_full)):
+				pkg, row = rows_full[idx]
+				prev_pkg = rows_full[idx - 1][0] if idx > 0 else None
+				next_pkg = rows_full[idx + 1][0] if idx < len(rows_full) - 1 else None
+				# method values for grouping within a package
+				row_method = row[1]
+				prev_method = rows_full[idx - 1][1][1] if idx > 0 else None
+				next_method = rows_full[idx + 1][1][1] if idx < len(rows_full) - 1 else None
+				# consumer values for grouping within a method
+				row_consumer = row[2]
+				next_consumer = rows_full[idx + 1][1][2] if idx < len(rows_full) - 1 else None
+				# Print full separator when package changes (except before the first row)
+				if prev_pkg is not None and pkg != prev_pkg:
+					print(sep)
+				# Suppress repeated package name within the same group
+				display_row = list(row)
+				if prev_pkg == pkg:
+					display_row[0] = ""
+				# Suppress repeated method name within the same package
+				if prev_pkg == pkg and prev_method == row_method:
+					display_row[1] = ""
+				# Suppress repeated consumer within the same package+method group
+				if prev_pkg == pkg and prev_method == row_method:
+					prev_consumer = rows_full[idx - 1][1][2] if idx > 0 else None
+					if prev_consumer == row_consumer:
+						display_row[2] = ""
+				# Handle multi-line cell in Functions (index 3)
+				if "\n" in display_row[3]:
+					funcs_lines = display_row[3].splitlines()
+					first = [display_row[0], display_row[1], display_row[2], funcs_lines[0]]
+					print(render_row(first))
+					for extra in funcs_lines[1:]:
+						print(render_row(["", "", "", extra]))
+				else:
+					print(render_row(display_row))
+				# Within a package, draw partial separators according to grouping level
+				if next_pkg == pkg:
+					if next_method != row_method:
+						# method boundary: draw from Method column to end (cols 2..N)
+						print(partial_sep_from_col(1))
+					elif next_consumer is not None and next_consumer != row_consumer:
+						# consumer boundary within same method: draw from Consumer column to end (cols 3..N)
+						print(partial_sep_from_col(2))
+
+			print(bot)
+
+	# Ensure progress line is cleared before exit
+	_clear_progress_line()
+
+	return 0
+
+if __name__ == "__main__":
+	sys.exit(main(sys.argv))
