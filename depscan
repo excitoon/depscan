@@ -27,6 +27,7 @@ import argparse
 import shutil
 import builtins
 import time
+import fnmatch
 
 
 GRPC_FILE_SUFFIX = "_grpc.pb.go"
@@ -179,6 +180,147 @@ def uri_to_path(uri: str) -> Path | None:
 	except Exception:
 		pass
 	return None
+
+
+# --- Cross-language helpers (Python/C#) ---
+
+def snake_to_pascal(name: str) -> str:
+	parts = [p for p in re.split(r"[_\-]", name) if p]
+	return ''.join(p[:1].upper() + p[1:] for p in parts)
+
+
+def parse_fqfn_python(file_path: Path, ref_line_1based: int, module_root: Path | None = None) -> str:
+	"""Rudimentary FQFN for Python: path/module[.Class].function"""
+	try:
+		lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+	except Exception:
+		lines = []
+	func_name = None
+	func_indent = None
+	class_name = None
+	# Find nearest def upwards
+	for i in range(min(len(lines), max(1, ref_line_1based)) - 1, -1, -1):
+		m = re.match(r"^(?P<indent>\s*)def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", lines[i])
+		if m:
+			func_name = re.findall(r"def\s+([A-Za-z_][A-Za-z0-9_]*)", lines[i])[0]
+			func_indent = len(m.group('indent').expandtabs(4))
+			# Look for enclosing class above with lower indent
+			for j in range(i - 1, -1, -1):
+				mc = re.match(r"^(?P<indent>\s*)class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\:", lines[j])
+				if mc:
+					ci = len(mc.group('indent').expandtabs(4))
+					if func_indent is None or ci < func_indent:
+						class_name = re.findall(r"class\s+([A-Za-z_][A-Za-z0-9_]*)", lines[j])[0]
+						break
+			break
+	# module path
+	try:
+		rel = str((module_root or file_path.parent).resolve())
+	except Exception:
+		rel = None
+	base_root = (module_root or Path.cwd()).resolve()
+	try:
+		rel_file = str(file_path.resolve().relative_to(base_root))
+	except Exception:
+		rel_file = str(file_path.name)
+	module_part = rel_file[:-3] if rel_file.endswith('.py') else rel_file
+	module_part = module_part.replace(os.sep, '/')
+	if class_name:
+		return f"{module_part}.{class_name}.{func_name or '(unknown)'}"
+	return f"{module_part}.{func_name or '(unknown)'}"
+
+
+def parse_fqfn_csharp(file_path: Path, ref_line_1based: int) -> str:
+	"""Rudimentary FQFN for C#: Namespace.Class.Method"""
+	try:
+		lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+	except Exception:
+		lines = []
+	method = None
+	cls = None
+	ns = None
+	# method upwards
+	for i in range(min(len(lines), max(1, ref_line_1based)) - 1, -1, -1):
+		if method is None:
+			m = re.match(r"^\s*(?:public|private|protected|internal|static|async|sealed|virtual|override|new|partial|extern|unsafe|readonly|ref|record|abstract|\s)+\s*[\w<>,\[\]\?\s]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", lines[i])
+			if m:
+				method = m.group(1)
+				continue
+		mc = re.match(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b", lines[i])
+		if mc and cls is None:
+			cls = mc.group(1)
+			continue
+		mn = re.match(r"^\s*namespace\s+([A-Za-z0-9_.]+)\b", lines[i])
+		if mn and ns is None:
+			ns = mn.group(1)
+			if method and cls:
+				break
+	parts = []
+	if ns:
+		parts.append(ns)
+	if cls:
+		parts.append(cls)
+	parts.append(method or '(unknown)')
+	return '.'.join(parts)
+
+
+def is_test_like_path(p: Path) -> bool:
+	name = p.name
+	parts = {s.lower() for s in p.parts}
+	return (
+		name.endswith("_test.py") or name.startswith("test_") or
+		name.endswith("Tests.cs") or name.endswith("Test.cs") or
+		"tests" in parts or "test" in parts
+	)
+
+
+def find_python_calls(search_root: Path, method: str, stub_guesses: list[str], include_tests: bool) -> list[tuple[Path, int]]:
+	pat_call = re.compile(r"\.(%s)\s*\(" % re.escape(method))
+	pat_future = re.compile(r"\.(%s)\s*\.\s*future\s*\(" % re.escape(method))
+	res: list[tuple[Path, int]] = []
+	for pyf in search_root.rglob("*.py"):
+		if not include_tests and is_test_like_path(pyf):
+			continue
+		try:
+			text = pyf.read_text(encoding="utf-8", errors="ignore")
+		except Exception:
+			continue
+		# Gate by likely stub presence and/or method token to reduce false positives but avoid misses
+		has_method_token = (f".{method}" in text) or (f".{method} " in text)
+		stub_ok = any(s in text for s in stub_guesses) or ("_pb2_grpc" in text) or has_method_token
+		if not stub_ok:
+			continue
+		lines = text.splitlines()
+		for i, line in enumerate(lines, start=1):
+			if pat_call.search(line) or pat_future.search(line):
+				res.append((pyf, i))
+	return res
+
+
+def find_csharp_calls(search_root: Path, method: str, client_guesses: list[str], include_tests: bool) -> list[tuple[Path, int]]:
+	pat_call = re.compile(r"\.(%s)\s*\(" % re.escape(method))
+	pat_async = re.compile(r"\.(%s)Async\s*\(" % re.escape(method))
+	res: list[tuple[Path, int]] = []
+	for csf in search_root.rglob("*.cs"):
+		# crude test filter
+		if not include_tests and is_test_like_path(csf):
+			continue
+		try:
+			text = csf.read_text(encoding="utf-8", errors="ignore")
+		except Exception:
+			continue
+		# Gate by client class guess, or simply presence of the method token (client may be created elsewhere)
+		guess_ok = any(g in text for g in client_guesses) if client_guesses else False
+		if not guess_ok:
+			has_method_token = (f".{method}" in text) or (f".{method}Async" in text)
+			guess_ok = has_method_token
+		if not guess_ok:
+			continue
+		lines = text.splitlines()
+		for i, line in enumerate(lines, start=1):
+			if pat_call.search(line) or pat_async.search(line):
+				res.append((csf, i))
+	return res
 
 
 def collect_package_dirs(paths: Iterable[Path]) -> set[Path]:
@@ -406,6 +548,13 @@ def main(argv: Sequence[str]) -> int:
 	parser.add_argument("root", nargs="?", default=str(Path.cwd()), help="Project root to scan (defaults to current working directory)")
 	parser.add_argument("--segments", "-n", type=int, default=1, help="Number of leading path segments to show for transitive consumers (default: 1)")
 	parser.add_argument("--format", choices=["table", "tsv"], default="table", help="Summary output format: table (unicode) or tsv (default: table)")
+	parser.add_argument(
+		"--langs",
+		nargs="+",
+		choices=["go", "python", "csharp"],
+		default=["go", "python", "csharp"],
+		help="Languages to scan for callers. Default: go, python, csharp. Add python and/or csharp to include those.",
+	)
 	parser.add_argument(
 		"--expand-top-level-pkg",
 		nargs="+",
@@ -906,6 +1055,36 @@ def main(argv: Sequence[str]) -> int:
 					fnames_all |= expanded
 			_update_sub(0.80)
 
+			# Optionally scan Python and C# callers (heuristic AST-lite) and add to fnames_all
+			service_name = service_base  # derived from directory (e.g., proxy_manager_v1 -> proxy_manager)
+			if "python" in args.langs:
+				# Try both PascalCase from dir and possible v-suffixed names
+				stub_guess = f"{snake_to_pascal(service_name)}Stub"
+				# Scan from the project root (not just Go module root) to catch cross-repo clients
+				py_calls = find_python_calls(root_arg, method, [stub_guess], include_tests=args.include_tests)
+				for (pf, pln) in py_calls:
+					# Prefer path:line form for cross-language callers and consumer grouping by path
+					try:
+						rel = pf.resolve().relative_to(root_arg.resolve())
+						entry = f"{str(rel).replace(os.sep, '/')}:{pln}"
+					except Exception:
+						entry = f"{pf.name}:{pln}"
+					fnames_all.add(entry)
+				_update_sub(min(0.85, 0.80 + 0.03))
+			if "csharp" in args.langs:
+				svc_pascal = snake_to_pascal(service_name)
+				client_guess = f"{svc_pascal}.{svc_pascal}Client"
+				# Scan from the project root to include C# projects outside Go module
+				cs_calls = find_csharp_calls(root_arg, method, [client_guess], include_tests=args.include_tests)
+				for (cf, cln) in cs_calls:
+					try:
+						rel = cf.resolve().relative_to(root_arg.resolve())
+						entry = f"{str(rel).replace(os.sep, '/')}:{cln}"
+					except Exception:
+						entry = f"{cf.name}:{cln}"
+					fnames_all.add(entry)
+				_update_sub(min(0.88, 0.85 + 0.03))
+
 			# Print functions in the scanning phase (3rd column content), now as FQFNs
 
 			# bump before printing
@@ -923,9 +1102,15 @@ def main(argv: Sequence[str]) -> int:
 			if args.consumer_source == "functions":
 				# Derive consumer segment from function FQFNs (first import path segment)
 				def consumer_from_fn(fn: str) -> str:
-					# fn looks like: path/to/pkg.(Type).Func or path/to/pkg.Func
-					pkg_path = fn.split(".", 1)[0]
-					first_seg = pkg_path.split("/", 1)[0] if "/" in pkg_path else pkg_path
+					# Accept either a module-style path or a file:line path. Prefer first path segment.
+					path_part = fn
+					# Strip :line if present
+					if ":" in path_part:
+						path_part = path_part.split(":", 1)[0]
+					# For Go FQFNs with dots, take the left-most path-ish part before first '.'
+					if "/" not in path_part and "." in path_part:
+						path_part = path_part.split(".", 1)[0]
+					first_seg = path_part.split("/", 1)[0] if "/" in path_part else path_part
 					return first_seg or "(unknown)"
 				if not fnames_all:
 					summary_rows.append((pkg_for_method, method, "(not used)", []))
