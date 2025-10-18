@@ -346,6 +346,7 @@ def enclosing_function_name(file_path: Path, ref_line_1based: int) -> str | None
 		lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
 	except Exception:
 		return None
+
 	# Match beginning-of-line 'func', optional receiver '(...)', optional name, then '('
 	func_re = re.compile(r"^func\s*(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)?\s*\(")
 	# Correct pattern (no stray quotes)
@@ -365,6 +366,113 @@ def enclosing_function_name(file_path: Path, ref_line_1based: int) -> str | None
 			else:
 				return "func-literal"
 	return None
+
+
+def parse_go_string_constants(dir_path: Path) -> dict[str, str]:
+	"""Parse Go source files in dir to find top-level string constants: name -> value."""
+	consts: dict[str, str] = {}
+	for gof in dir_path.rglob("*.go"):
+		try:
+			text = gof.read_text(encoding="utf-8", errors="ignore")
+		except Exception:
+			continue
+		# handle const ( ... ) blocks and single const lines
+		# Very simple regex; not a full parser
+		# Single-line: const Name = "value"
+		for m in re.finditer(r"(?m)^\s*const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\"([^\"]*)\"", text):
+			consts[m.group(1)] = m.group(2)
+		# Block: const (\n Name = "value"\n)
+		for blk in re.finditer(r"(?ms)^\s*const\s*\((.*?)\)", text):
+			body = blk.group(1)
+			for m in re.finditer(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\"([^\"]*)\"", body):
+				consts[m.group(1)] = m.group(2)
+	return consts
+
+
+def scan_nats_usages(search_root: Path, subjects: dict[str, str], include_tests: bool) -> list[tuple[str, str, Path, int]]:
+	"""Return list of (topic, type, file, line) where type is 'producer' or 'consumer'."""
+	results: list[tuple[str, str, Path, int]] = []
+	if not subjects:
+		return results
+	name_to_topic = subjects.copy()
+	# Regexes for subscribe/publish
+	# Accept forms: .Subscribe(<expr>, ...) where <expr> can be subjectq.Const, "literal", or fmt.Sprintf(...)
+	pat_sub = re.compile(r"\.Subscribe\s*\(\s*(?P<arg>[^,\n\r)]+)")
+	pat_pub = re.compile(r"\.Publish\s*\(\s*(?P<arg>[^,\n\r)]+)")
+	# Assignment patterns for simple local variable resolution
+	pat_assign_const = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\s*$")
+	pat_assign_lit = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*\"([^\"]+)\"\s*$")
+	pat_assign_sprintf_lit = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*fmt\.Sprintf\s*\(\s*\"([^\"]+)\"[,)\s]")
+	pat_assign_sprintf_const = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*fmt\.Sprintf\s*\(\s*([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)[,)\s]")
+	pat_func_decl = re.compile(r"^\s*func\s*\(")
+	for gof in search_root.rglob("*.go"):
+		if not include_tests and gof.name.endswith("_test.go"):
+			continue
+		try:
+			text = gof.read_text(encoding="utf-8", errors="ignore")
+		except Exception:
+			continue
+		lines = text.splitlines()
+		var_topic: dict[str, str] = {}
+		for i, line in enumerate(lines, start=1):
+			# Reset simple var map at function boundaries to reduce leakage across scopes
+			if line.lstrip().startswith("func "):
+				var_topic.clear()
+			# Track simple assignments
+			m = pat_assign_lit.match(line)
+			if m:
+				var_topic[m.group(1)] = m.group(2)
+			else:
+				m = pat_assign_const.match(line)
+				if m:
+					qual = m.group(2)
+					name = qual.split(".")[-1]
+					if name in name_to_topic:
+						var_topic[m.group(1)] = name_to_topic[name]
+				else:
+					m = pat_assign_sprintf_lit.match(line)
+					if m:
+						var_topic[m.group(1)] = m.group(2)
+					else:
+						m = pat_assign_sprintf_const.match(line)
+						if m:
+							qual = m.group(2)
+							name = qual.split(".")[-1]
+							if name in name_to_topic:
+								var_topic[m.group(1)] = name_to_topic[name]
+			for kind, pat in (("consumer", pat_sub), ("producer", pat_pub)):
+				m = pat.search(line)
+				if not m:
+					continue
+				arg = m.group("arg").strip()
+				topic: str | None = None
+				# subjectq.Const
+				mm = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)$", arg)
+				if mm:
+					name = mm.group(1)
+					topic = name_to_topic.get(name)
+				# "literal"
+				if not topic:
+					ml = re.match(r"\"([^\"]+)\"", arg)
+					if ml:
+						topic = ml.group(1)
+				# fmt.Sprintf("pattern", ...)
+				if not topic and arg.startswith("fmt.Sprintf("):
+					ml2 = re.match(r"fmt\.Sprintf\s*\(\s*\"([^\"]+)\"", arg)
+					if ml2:
+						topic = ml2.group(1)
+					else:
+						# fmt.Sprintf(subjectq.Const, ...)
+						mc = re.match(r"fmt\.Sprintf\s*\(\s*([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)", arg)
+						if mc:
+							name = mc.group(1).split(".")[-1]
+							topic = name_to_topic.get(name)
+				# variable reference previously assigned
+				if not topic and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", arg):
+					topic = var_topic.get(arg)
+				if topic:
+					results.append((topic, kind, gof, i))
+	return results
 
 
 def find_function_def_positions(root: Path, func_name: str, include_tests: bool = False) -> list[tuple[Path, int, int]]:
@@ -583,6 +691,11 @@ def main(argv: Sequence[str]) -> int:
 		nargs="?",
 		const="auto",
 		default=None,
+	)
+	parser.add_argument(
+		"--subjects-dir",
+		help="Directory containing Go constants for NATS subjects (default: `pkg/subjectq` relative to module root)",
+		default="pkg/subjectq",
 	)
 	parser.add_argument(
 		"--debug-expand",
@@ -1271,6 +1384,75 @@ def main(argv: Sequence[str]) -> int:
 						print(partial_sep_from_col(2))
 
 			print(bot)
+
+	# After gRPC summary, attempt NATS subjects scan and render a separate table
+	try:
+		subjects_dir = (module_root or search_root) / Path(args.subjects_dir)
+		subjects: dict[str, str] = {}
+		if subjects_dir.exists() and subjects_dir.is_dir():
+			subjects = parse_go_string_constants(subjects_dir)
+		if subjects:
+			usages = scan_nats_usages(search_root, subjects, include_tests=args.include_tests)
+			# Build rows: Topic, Type, Package, Function
+			nats_rows: list[tuple[str, str, str, str]] = []
+			for topic, kind, fpath, lno in usages:
+				# package from first path segment relative to module root
+				try:
+					rel = fpath.resolve().relative_to((module_root or search_root).resolve())
+					pkg = rel.parts[0] if len(rel.parts) > 0 else ""
+				except Exception:
+					pkg = fpath.parent.name
+				fq = parse_fqfn_for_location(
+					fpath, lno,
+					import_path_by_dir=locals().get('import_path_by_dir'),
+					module_root=module_root,
+					module_path=module_path,
+				)
+				func_cell = fq if fq else f"{str(fpath)}:{lno}"
+				nats_rows.append((topic, kind, pkg, func_cell))
+			# Render
+			if nats_rows:
+				if args.format == "tsv":
+					for topic, kind, pkg, fn in nats_rows:
+						print(f"{topic}\t{kind}\t{pkg}\t{fn}")
+				else:
+					headers2 = ["Topic", "Type", "Package", "Function"]
+					# compute widths
+					def width_for_cell(val: str) -> int:
+						if "\n" in str(val):
+							return max(len(p) for p in str(val).splitlines())
+						return len(str(val))
+					w2 = [0, 0, 0, 0]
+					for i, h in enumerate(headers2):
+						w2[i] = max(w2[i], len(h))
+					for r in nats_rows:
+						for i, c in enumerate(r):
+							w2[i] = max(w2[i], width_for_cell(c))
+					def line2(l: str, m: str, r: str, fill: str) -> str:
+						parts = [fill * (w + 2) for w in w2]
+						return l + m.join(parts) + r
+					top2 = line2("┌", "┬", "┐", "─")
+					sep2 = line2("├", "┼", "┤", "─")
+					bot2 = line2("└", "┴", "┘", "─")
+					def render2(cells: list[str]) -> str:
+						padded = [f" {str(cells[i]).ljust(w2[i])} " for i in range(len(w2))]
+						return "│" + "│".join(padded) + "│"
+					print("\n" + top2)
+					print(render2(headers2))
+					print(sep2)
+					for topic, kind, pkg, fn in sorted(nats_rows, key=lambda x: (x[0], x[1], x[2], x[3])):
+						# handle multi-line function cell
+						if "\n" in fn:
+							parts = fn.splitlines()
+							print(render2([topic, kind, pkg, parts[0]]))
+							for extra in parts[1:]:
+								print(render2(["", "", "", extra]))
+						else:
+							print(render2([topic, kind, pkg, fn]))
+					print(bot2)
+	except Exception:
+		# NATS scan is best-effort; ignore errors silently
+		pass
 
 	# Ensure progress line is cleared before exit
 	_clear_progress_line()
