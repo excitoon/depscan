@@ -1393,22 +1393,71 @@ def main(argv: Sequence[str]) -> int:
 			subjects = parse_go_string_constants(subjects_dir)
 		if subjects:
 			usages = scan_nats_usages(search_root, subjects, include_tests=args.include_tests)
-			# Build rows: Topic, Type, Package, Function
-			nats_rows: list[tuple[str, str, str, str]] = []
+			# First, enrich usages with function info and expand top-level pkg callers
+			final_entries: list[tuple[str, str, str]] = []  # (topic, type, functionFQFN_or_pathline)
 			for topic, kind, fpath, lno in usages:
-				# package from first path segment relative to module root
-				try:
-					rel = fpath.resolve().relative_to((module_root or search_root).resolve())
-					pkg = rel.parts[0] if len(rel.parts) > 0 else ""
-				except Exception:
-					pkg = fpath.parent.name
 				fq = parse_fqfn_for_location(
 					fpath, lno,
 					import_path_by_dir=locals().get('import_path_by_dir'),
 					module_root=module_root,
 					module_path=module_path,
 				)
-				func_cell = fq if fq else f"{str(fpath)}:{lno}"
+				# Determine if usage is inside a top-level dir (e.g., pkg/...) and expand by callers if so
+				is_top_level = False
+				try:
+					rel_fp = fpath.resolve().relative_to((module_root or search_root).resolve())
+					is_top_level = len(rel_fp.parts) >= 2 and rel_fp.parts[0] in (args.expand_top_level_pkg or []) and rel_fp.parts[1]
+				except Exception:
+					is_top_level = False
+				if is_top_level:
+					# Find callers of the enclosing function and attribute NATS usage to them
+					simple_name = enclosing_function_name(fpath, lno)
+					if simple_name:
+						call_sites = find_callers_of_function(
+							search_root, simple_name, cwd=search_root,
+							include_tests=args.include_tests, gopls_args=gopls_extra,
+						)
+						for (cp, cln) in call_sites:
+							cfq = parse_fqfn_for_location(
+								cp, cln if cln else 1,
+								import_path_by_dir=locals().get('import_path_by_dir'),
+								module_root=module_root,
+								module_path=module_path,
+							)
+							if cfq:
+								# Skip reintroducing callers that are also in top-level dirs
+								try:
+									rel_cp = cp.resolve().relative_to((module_root or search_root).resolve())
+									if len(rel_cp.parts) >= 2 and rel_cp.parts[0] in (args.expand_top_level_pkg or []) and rel_cp.parts[1]:
+										continue
+								except Exception:
+									pass
+								final_entries.append((topic, kind, cfq))
+					continue
+				# Not top-level: keep the function as is
+				final_entries.append((topic, kind, fq if fq else f"{str(fpath)}:{lno}"))
+
+			# Build rows: Topic, Type, Package (from function FQFN), Function
+			nats_rows: list[tuple[str, str, str, str]] = []
+			seen_row_keys: set[tuple[str, str, str]] = set()
+			for topic, kind, func_cell in final_entries:
+				# Derive package from FQFN if possible
+				pkg = ""
+				if func_cell and "/" in func_cell and ":" in func_cell and not ("." in func_cell.split(":", 1)[0]):
+					# file:line fallback path — derive from path relative to module
+					try:
+						p = Path(func_cell.split(":", 1)[0])
+						rel = p.resolve().relative_to((module_root or search_root).resolve())
+						pkg = rel.parts[0] if rel.parts else ""
+					except Exception:
+						pkg = p.parent.name if 'p' in locals() else ""
+				else:
+					# Assume Go FQFN: module-relative-path[.(...].Func) -> take left side before first '.'
+					pkg = (func_cell.split('.', 1)[0] or "").split('/')[0]
+				key = (topic, kind, func_cell)
+				if key in seen_row_keys:
+					continue
+				seen_row_keys.add(key)
 				nats_rows.append((topic, kind, pkg, func_cell))
 			# Render
 			if nats_rows:
